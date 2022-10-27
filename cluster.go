@@ -543,3 +543,70 @@ func (c *Cluster) Stats() map[string]redis.PoolStats {
 	}
 	return stats
 }
+
+// return the addr list corresponding slots
+func (c *Cluster) getAddrForSlots(slots []int, readOnly bool) (addrs []string, err error) {
+	var (
+		sliceAddrs [][]string
+	)
+	if len(slots) <= 0 {
+		return nil, errors.New("empty slots")
+	}
+	sliceAddrs = make([][]string, len(slots))
+	addrs = make([]string, len(slots))
+	rslot := -1
+	c.mu.Lock()
+	for i, slot := range slots {
+		// if slot is out of c.mapping range then set to a fixed random value
+		if slot < 0 || slot >= HashSlots {
+			if rslot < 0 {
+				rnd.Lock()
+				rslot = rnd.Intn(HashSlots - 1)
+				rnd.Unlock()
+			}
+			slot = rslot
+		}
+		sliceAddrs[i] = c.mapping[slot]
+	}
+	c.mu.Unlock()
+
+	for i, as := range sliceAddrs {
+		// mapping slices are never altered, they are replaced when refreshing
+		// or on a MOVED response, so it's non-racy to read them outside the lock.
+		if len(as) > 0 {
+			addr := as[0]
+			// get the address of a replica
+			if len(as) == 2 {
+				addr = as[1]
+			} else if len(as) > 2 {
+				rnd.Lock()
+				ix := rnd.Intn(len(as) - 1)
+				rnd.Unlock()
+				addr = as[ix+1] // +1 because 0 is the master
+			}
+			addrs[i] = addr
+		}
+	}
+	return
+}
+
+// GetPipelinerConn returns a Conn interface that can handle Redis Pipeline
+func (c *Cluster) GetPipelinerConn() redis.Conn {
+	return newPipeliner(c)
+}
+
+// GetConnForAddr returns a Conn interface bound to the addr
+func (c *Cluster) GetConnForAddr(addr string, forceDial, readOnly bool) redis.Conn {
+	c.mu.Lock()
+	err := c.err
+	c.mu.Unlock()
+
+	conn := &Conn{
+		cluster:   c,
+		err:       err,
+		forceDial: forceDial,
+		readOnly:  readOnly,
+	}
+	conn.BindAddr(addr)
+	return conn
+}

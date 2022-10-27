@@ -11,29 +11,36 @@ import (
 	"github.com/gomodule/redigo/redis"
 )
 
+const (
+	CMDMSET    = "MSET"
+	CMDMGET    = "MGET"
+	CMDEVAL    = "EVAL"
+	CMDEVALSHA = "EVALSHA"
+)
+
 var _ redis.ConnWithTimeout = (*Conn)(nil)
 
 // Conn is a redis cluster connection. When returned by Get or Dial, it is not
 // yet bound to any node in the cluster.  Only when a call to Do, Send, Receive
 // or Bind is made is a connection to a specific node established:
 //
-//     - if Do or Send is called first, the command's first parameter is
+//   - if Do or Send is called first, the command's first parameter is
 //     assumed to be the key, and its slot is used to find the node
-//     - if Receive is called first, or if Do or Send is called first but with
+//   - if Receive is called first, or if Do or Send is called first but with
 //     no parameter for the command (or no command), a random node is selected
 //     in the cluster
-//     - if Bind is called first, the node corresponding to the slot of the
+//   - if Bind is called first, the node corresponding to the slot of the
 //     specified key(s) is selected
 //
 // Because Get and Dial return a redis.Conn interface, a type assertion can be
 // used to call Bind or ReadOnly on this concrete Conn type:
 //
-//     redisConn := cluster.Get()
-//     if conn, ok := redisConn.(*redisc.Conn); ok {
-//       if err := conn.Bind("my-key"); err != nil {
-//         // handle error
-//       }
-//     }
+//	   redisConn := cluster.Get()
+//	   if conn, ok := redisConn.(*redisc.Conn); ok {
+//		  if err := conn.Bind("my-key"); err != nil {
+//		    // handle error
+//		  }
+//		}
 //
 // Alternatively, the package-level BindConn or ReadOnlyConn helper functions
 // may be used.
@@ -137,10 +144,17 @@ func (c *Conn) bind(slot int) (rc redis.Conn, ok bool, err error) {
 	return rc, ok, err
 }
 
-func cmdSlot(_ string, args []interface{}) int {
+func cmdSlot(commandName string, args []interface{}) int {
 	slot := -1
-	if len(args) > 0 {
-		key := fmt.Sprintf("%s", args[0])
+	sk := 0
+
+	// for script command, use the first key to calculate slot, so we can do a script with only one key handling
+	// NOTE: you should not handle muliple keys in one script command in a redis cluster
+	if commandName == CMDEVAL || commandName == CMDEVALSHA {
+		sk = 2
+	}
+	if len(args) > sk {
+		key := fmt.Sprintf("%s", args[sk])
 		slot = Slot(key)
 	}
 	return slot
@@ -247,6 +261,13 @@ func (c *Conn) DoWithTimeout(timeout time.Duration, cmd string, args ...interfac
 		if rc == nil {
 			return nil, nil
 		}
+	}
+
+	// hooked for special command like mset/mget
+	hooked := false
+	hooked, v, err = c.hookCommand(timeout, cmd, args...)
+	if hooked {
+		return
 	}
 
 	rc, _, err := c.bind(cmdSlot(cmd, args))
@@ -358,4 +379,35 @@ func (c *Conn) closeLocked() (err error) {
 		err = c.rc.Close()
 	}
 	return err
+}
+
+func (c *Conn) hookCommand(timeout time.Duration, cmd string, args ...interface{}) (bool, interface{}, error) {
+	if cmd == CMDMSET {
+		v, err := multiset(c, args...)
+		return true, v, err
+	} else if cmd == CMDMGET {
+		v, err := multiget(c, args...)
+		return true, v, err
+	}
+	return false, nil, nil
+}
+
+// BindAddr binds the connection to a specific node with addr
+func (c *Conn) BindAddr(addr string) (rc redis.Conn, ok bool, err error) {
+	c.mu.Lock()
+	rc, err = c.rc, c.err
+	if err == nil {
+		if rc == nil {
+			conn, err2 := c.cluster.getConnForAddr(addr, c.forceDial)
+			if err2 != nil {
+				err = err2
+			} else {
+				c.rc, rc = conn, conn
+				c.boundAddr = addr
+				ok = true
+			}
+		}
+	}
+	c.mu.Unlock()
+	return rc, ok, err
 }
